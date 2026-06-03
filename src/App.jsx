@@ -157,8 +157,44 @@ function importFromJSON(file) {
     reader.onload = (e) => {
       try {
         const data = JSON.parse(e.target.result);
-        if (data && data.homeCurrency && data.wallets) resolve(data);
-        else reject(new Error("Invalid backup format"));
+        if (!data || !data.homeCurrency) {
+          reject(new Error("Invalid backup format"));
+          return;
+        }
+        // Already v2 format
+        if (data.wallets) {
+          resolve(data);
+          return;
+        }
+        // Migrate v1 (flat) → v2 (multi-wallet)
+        if (data.travelCurrency && (Array.isArray(data.exchanges) || Array.isArray(data.payments))) {
+          const tc = data.travelCurrency;
+          const cardRates = {};
+          (data.cards || []).forEach((c) => {
+            if (c.rate) cardRates[c.id] = c.rate;
+          });
+          const migrated = {
+            homeCurrency: data.homeCurrency,
+            activeWallet: tc,
+            cards: (data.cards || []).map((c) => ({ id: c.id, name: c.name, markup: c.markup || "0" })),
+            wallets: {
+              [tc]: {
+                travelCurrency: tc,
+                marketRate: data.marketRate || "",
+                marketRateUpdated: data.marketRateUpdated || null,
+                marketRateSource: data.marketRateSource || null,
+                exchanges: data.exchanges || [],
+                payments: data.payments || [],
+                manualBalance: "0",
+                cardRates,
+                created: new Date().toLocaleString(),
+              }
+            }
+          };
+          resolve(migrated);
+          return;
+        }
+        reject(new Error("Invalid backup format"));
       } catch (err) { reject(err); }
     };
     reader.onerror = () => reject(new Error("Failed to read file"));
