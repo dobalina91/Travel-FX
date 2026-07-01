@@ -71,17 +71,11 @@ function fmt(num, dec = 2) {
 
 // ─── Storage ────────────────────────────────────────────────────────────────
 
-function loadState() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch (e) { /* ignore */ }
-  return null;
-}
+// loadState handled async in useEffect
 
 function saveState(state) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    window.storage.set(STORAGE_KEY, JSON.stringify(state));
   } catch (e) { /* ignore */ }
 }
 
@@ -90,29 +84,37 @@ function saveState(state) {
 async function fetchLiveRate(from, to) {
   const apis = [
     {
-      name: "Frankfurter",
-      url: `https://api.frankfurter.dev/v2/rates?base=${from}&quotes=${to}`,
-      parse: (d) => d?.rates?.[to],
-    },
-    {
       name: "ExchangeRate-API",
       url: `https://open.er-api.com/v6/latest/${from}`,
       parse: (d) => d?.rates?.[to],
+      getTime: (d) => d?.time_last_update_utc || null,
+    },
+    {
+      name: "Frankfurter",
+      url: `https://api.frankfurter.dev/v2/rates?base=${from}&quotes=${to}`,
+      parse: (d) => d?.rates?.[to],
+      getTime: (d) => d?.date || null,
     },
     {
       name: "Currency-API",
       url: `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/${from.toLowerCase()}.min.json`,
       parse: (d) => d?.[from.toLowerCase()]?.[to.toLowerCase()],
+      getTime: (d) => d?.date || null,
     },
   ];
-  for (const api of apis) {
-    try {
-      const res = await fetch(api.url, { signal: AbortSignal.timeout(5000) });
-      if (!res.ok) continue;
+  // Fetch all in parallel, pick first valid result
+  const results = await Promise.allSettled(
+    apis.map(async (api) => {
+      const res = await fetch(api.url, { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
       const rate = api.parse(data);
-      if (rate && !isNaN(rate) && rate > 0) return { rate, source: api.name, time: new Date().toLocaleString() };
-    } catch (e) { continue; }
+      if (!rate || isNaN(rate) || rate <= 0) throw new Error("No rate");
+      return { rate, source: api.name, time: new Date().toLocaleString(), sourceTime: api.getTime(data) };
+    })
+  );
+  for (const r of results) {
+    if (r.status === "fulfilled") return r.value;
   }
   return null;
 }
@@ -240,20 +242,35 @@ function Card({ children, title, action, style: s }) {
 }
 
 function NumInput({ value, onChange, placeholder, prefix, suffix, style: s, ...props }) {
+  const prefixRef = useRef(null);
+  const suffixRef = useRef(null);
+  const [padL, setPadL] = useState(14);
+  const [padR, setPadR] = useState(14);
+
+  useEffect(() => {
+    if (prefix && prefixRef.current) setPadL(prefixRef.current.offsetWidth + 20);
+    else setPadL(14);
+  }, [prefix]);
+
+  useEffect(() => {
+    if (suffix && suffixRef.current) setPadR(suffixRef.current.offsetWidth + 20);
+    else setPadR(14);
+  }, [suffix]);
+
   return (
     <div style={{ position: "relative", display: "flex", alignItems: "center", ...s }}>
-      {prefix && <span style={{ position: "absolute", left: 12, color: T.textTer, fontSize: 13, fontWeight: 600, pointerEvents: "none" }}>{prefix}</span>}
+      {prefix && <span ref={prefixRef} style={{ position: "absolute", left: 12, color: T.textTer, fontSize: 13, fontWeight: 600, pointerEvents: "none", whiteSpace: "nowrap" }}>{prefix}</span>}
       <input
         type="number" inputMode="decimal" step="any" value={value}
         onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
         style={{
           width: "100%", background: T.input, border: `1px solid ${T.inputBorder}`, borderRadius: 10,
-          color: T.text, padding: `10px ${suffix ? 44 : 14}px 10px ${prefix ? 42 : 14}px`,
+          color: T.text, padding: `10px ${padR}px 10px ${padL}px`,
           fontSize: 15, fontFamily: "'DM Mono', monospace", outline: "none",
         }}
         {...props}
       />
-      {suffix && <span style={{ position: "absolute", right: 12, color: T.textTer, fontSize: 12, fontWeight: 600, pointerEvents: "none" }}>{suffix}</span>}
+      {suffix && <span ref={suffixRef} style={{ position: "absolute", right: 12, color: T.textTer, fontSize: 12, fontWeight: 600, pointerEvents: "none", whiteSpace: "nowrap" }}>{suffix}</span>}
     </div>
   );
 }
@@ -328,8 +345,14 @@ export default function TravelFX() {
   const fileInputRef = useRef(null);
 
   useEffect(() => {
-    setState(loadState() || defaultState());
-    setLoading(false);
+    (async () => {
+      try {
+        const result = await window.storage.get(STORAGE_KEY);
+        if (result && result.value) setState(JSON.parse(result.value));
+        else setState(defaultState());
+      } catch (e) { setState(defaultState()); }
+      setLoading(false);
+    })();
   }, []);
 
   useEffect(() => {
@@ -621,8 +644,63 @@ function ExchangeTab({ state, update, updateWallet, home, travel, wallet, wallet
   const [homeAmt, setHomeAmt] = useState("");
   const [travelAmt, setTravelAmt] = useState("");
   const [shop, setShop] = useState("");
+  const [showGuide, setShowGuide] = useState(false);
 
-  const marketRate = parseFloat(wallet.marketRate) || 0;
+  // Rate comparison tool state
+  const [shopRateInput, setShopRateInput] = useState("");
+  const [rateFormat, setRateFormat] = useState("homePerTravel"); // how the shop quotes
+  const [compareList, setCompareList] = useState([]);
+
+  const marketRate = parseFloat(wallet.marketRate) || 0; // travel per home (e.g. 4.14 THB per HKD)
+  // Mid-market expressed as home-per-travel (e.g. HKD per THB) for cost comparison
+  const midHomePerTravel = marketRate > 0 ? 1 / marketRate : 0;
+
+  const lr = liveRates[walletCode];
+
+  // ── Rate comparison logic ──
+  // Normalize any shop input to "home currency spent per 1 travel unit received"
+  const rawShopRate = parseFloat(shopRateInput) || 0;
+  const shopHomePerTravel = rawShopRate > 0
+    ? (rateFormat === "homePerTravel" ? rawShopRate : 1 / rawShopRate)
+    : 0;
+  // vs mid-market: positive = you pay more than mid (worse)
+  const compareDiffPct = midHomePerTravel > 0 && shopHomePerTravel > 0
+    ? (shopHomePerTravel - midHomePerTravel) / midHomePerTravel
+    : null;
+
+  const verdict = (diff) => {
+    if (diff === null) return null;
+    const abs = Math.abs(diff * 100);
+    if (diff <= 0) return { color: T.good, bg: T.goodBg, label: "Excellent — better than mid-market!", icon: "🤑" };
+    if (abs < 1) return { color: T.good, bg: T.goodBg, label: "Great rate", icon: "✅" };
+    if (abs < 2.5) return { color: T.warn, bg: T.warnBg, label: "OK rate", icon: "😐" };
+    if (abs < 5) return { color: T.bad, bg: T.badBg, label: "Poor — keep looking", icon: "⚠️" };
+    return { color: T.bad, bg: T.badBg, label: "Bad — avoid this shop", icon: "🛑" };
+  };
+  const v = verdict(compareDiffPct);
+
+  const addToCompare = () => {
+    if (shopHomePerTravel <= 0) return;
+    setCompareList([...compareList, {
+      id: Date.now(),
+      name: shop || `Shop ${compareList.length + 1}`,
+      homePerTravel: shopHomePerTravel,
+      raw: rawShopRate,
+      format: rateFormat,
+      diff: compareDiffPct,
+    }]);
+    setShopRateInput("");
+    setShop("");
+  };
+
+  const removeFromCompare = (id) => setCompareList(compareList.filter((c) => c.id !== id));
+
+  // Best shop = lowest homePerTravel
+  const bestId = compareList.length > 0
+    ? compareList.reduce((best, c) => (c.homePerTravel < best.homePerTravel ? c : best), compareList[0]).id
+    : null;
+
+  // ── Record exchange logic ──
   const shopRate = homeAmt && travelAmt ? parseFloat(travelAmt) / parseFloat(homeAmt) : 0;
   const diffPct = marketRate && shopRate ? (marketRate - shopRate) / marketRate : 0;
   const diffAmt = homeAmt && marketRate && shopRate ? parseFloat(homeAmt) * (marketRate - shopRate) / marketRate : 0;
@@ -641,8 +719,6 @@ function ExchangeTab({ state, update, updateWallet, home, travel, wallet, wallet
     updateWallet(walletCode, { exchanges: wallet.exchanges.filter((e) => e.id !== id) });
   };
 
-  const lr = liveRates[walletCode];
-
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       {/* Wallet indicator */}
@@ -650,53 +726,241 @@ function ExchangeTab({ state, update, updateWallet, home, travel, wallet, wallet
         <span style={{ fontSize: 18 }}>{travel.flag}</span>
         <span style={{ fontSize: 13, fontWeight: 700, color: T.accent }}>{travel.code} Wallet</span>
         <span style={{ marginLeft: "auto", fontSize: 12, color: T.textSec }}>
-          {home.code} → {travel.code}
+          Buying {travel.code} with {home.code}
         </span>
       </div>
 
       {/* Market rate */}
-      <Card title="Market Rate">
+      <Card title="Mid-Market Rate (the 'real' rate)">
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <NumInput value={wallet.marketRate}
             onChange={(v) => updateWallet(walletCode, { marketRate: v, marketRateUpdated: new Date().toLocaleString(), marketRateSource: "Manual" })}
             placeholder="e.g. 4.1463" prefix={`1 ${home.code} =`} suffix={travel.code} />
+          {marketRate > 0 && (
+            <div style={{ fontSize: 12, color: T.textSec, background: T.input, padding: "6px 10px", borderRadius: 8 }}>
+              = <strong style={{ fontFamily: "'DM Mono', monospace" }}>1 {travel.code} = {home.symbol}{fmt(midHomePerTravel, 4)}</strong> <span style={{ color: T.textTer }}>(what shops usually quote)</span>
+            </div>
+          )}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <span style={{ fontSize: 11, color: T.textTer }}>
               {wallet.marketRateUpdated ? `${wallet.marketRateSource || "Manual"} · ${wallet.marketRateUpdated}` : "Not set"}
             </span>
             <a href={`https://www.xe.com/currencyconverter/convert/?From=${home.code}&To=${travel.code}`}
               target="_blank" rel="noopener noreferrer"
-              style={{ fontSize: 11, color: T.accent, textDecoration: "none", fontWeight: 700 }}>XE.com ↗</a>
+              style={{ fontSize: 11, color: T.accent, textDecoration: "none", fontWeight: 700 }}>Check on XE.com ↗</a>
           </div>
           {lr && (
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 10px", background: T.input, borderRadius: 8 }}>
-              <span style={{ fontSize: 12, color: T.textSec }}>
-                Live: <strong style={{ fontFamily: "'DM Mono', monospace" }}>{fmt(lr.rate, 4)}</strong>
-                <span style={{ color: T.textTer }}> via {lr.source}</span>
-              </span>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 10px", background: T.input, borderRadius: 8 }}>
+              <div>
+                <div style={{ fontSize: 12, color: T.textSec }}>
+                  Live: <strong style={{ fontFamily: "'DM Mono', monospace" }}>{fmt(lr.rate, 4)}</strong>
+                  <span style={{ color: T.textTer }}> via {lr.source}</span>
+                </div>
+                {lr.sourceTime && <div style={{ fontSize: 10, color: T.textTer, marginTop: 1 }}>Data: {lr.sourceTime}</div>}
+              </div>
               <button onClick={() => updateWallet(walletCode, { marketRate: String(lr.rate), marketRateUpdated: new Date().toLocaleString(), marketRateSource: lr.source })}
-                style={{ background: T.accent, border: "none", borderRadius: 6, color: "#fff", padding: "4px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+                style={{ background: T.accent, border: "none", borderRadius: 6, color: "#fff", padding: "5px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
                 Use
               </button>
+            </div>
+          )}
+          {!lr && (
+            <div style={{ fontSize: 11, color: T.textTer, fontStyle: "italic" }}>
+              Note: the in-app live rate comes from free rate APIs, not XE directly. XE adds its own spread, so numbers may differ slightly. Both are "mid-market" reference rates.
             </div>
           )}
         </div>
       </Card>
 
-      {/* Record exchange */}
-      <Card title={`Record ${home.code} → ${travel.code} Exchange`}>
+      {/* ═══ RATE CHECKER (before changing money) ═══ */}
+      <Card title="🔍 Check a Shop's Rate">
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <p style={{ margin: 0, fontSize: 12, color: T.textSec }}>
+            Standing at a money changer? Punch in the number on their board and see instantly if it's good — no need to change any money first.
+          </p>
+
+          {marketRate === 0 && (
+            <div style={{ padding: "8px 10px", background: T.warnBg, borderRadius: 8, fontSize: 12, color: T.warn }}>
+              ⚠️ Set the mid-market rate above first, so we can compare.
+            </div>
+          )}
+
+          <input value={shop} onChange={(e) => setShop(e.target.value)} placeholder="Shop name (optional)"
+            style={{ width: "100%", boxSizing: "border-box", background: T.input, border: `1px solid ${T.inputBorder}`, borderRadius: 10, color: T.text, padding: "10px 14px", fontSize: 14, fontFamily: "inherit", outline: "none" }} />
+
+          {/* Format toggle */}
+          <div>
+            <label style={{ fontSize: 11, color: T.textTer, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>The board shows the rate as:</label>
+            <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+              <button onClick={() => setRateFormat("homePerTravel")}
+                style={{ flex: 1, padding: "10px 8px", borderRadius: 10, border: rateFormat === "homePerTravel" ? `2px solid ${T.accent}` : `1px solid ${T.inputBorder}`, background: rateFormat === "homePerTravel" ? T.accentLight : T.card, color: rateFormat === "homePerTravel" ? T.accent : T.textSec, fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", lineHeight: 1.3 }}>
+                {home.symbol} per 1 {travel.code}
+                <div style={{ fontSize: 10, fontWeight: 500, marginTop: 2, opacity: 0.8 }}>
+                  {midHomePerTravel > 0 ? `e.g. ${home.symbol}${fmt(midHomePerTravel, midHomePerTravel < 1 ? 4 : 2)}` : `e.g. ${home.symbol}0.05`}
+                </div>
+              </button>
+              <button onClick={() => setRateFormat("travelPerHome")}
+                style={{ flex: 1, padding: "10px 8px", borderRadius: 10, border: rateFormat === "travelPerHome" ? `2px solid ${T.accent}` : `1px solid ${T.inputBorder}`, background: rateFormat === "travelPerHome" ? T.accentLight : T.card, color: rateFormat === "travelPerHome" ? T.accent : T.textSec, fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", lineHeight: 1.3 }}>
+                {travel.code} per 1 {home.code}
+                <div style={{ fontSize: 10, fontWeight: 500, marginTop: 2, opacity: 0.8 }}>
+                  {marketRate > 0 ? `e.g. ${fmt(marketRate, marketRate < 1 ? 4 : 2)}` : `e.g. 20.68`}
+                </div>
+              </button>
+            </div>
+          </div>
+
+          <NumInput value={shopRateInput} onChange={setShopRateInput} placeholder="Type the board number"
+            prefix={rateFormat === "homePerTravel" ? home.symbol : travel.symbol} />
+
+          {/* Verdict */}
+          {v && shopHomePerTravel > 0 && (
+            <div style={{ padding: "12px 14px", borderRadius: 12, background: v.bg, border: `1px solid ${v.color}22` }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 22 }}>{v.icon}</span>
+                <span style={{ fontSize: 15, fontWeight: 800, color: v.color }}>{v.label}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: T.textSec }}>
+                <span>You'd pay per 1 {travel.code}</span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontWeight: 700 }}>{home.symbol}{fmt(shopHomePerTravel, 4)}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: T.textSec }}>
+                <span>Mid-market is</span>
+                <span style={{ fontFamily: "'DM Mono', monospace" }}>{home.symbol}{fmt(midHomePerTravel, 4)}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginTop: 4, paddingTop: 4, borderTop: `1px solid ${v.color}22` }}>
+                <span style={{ fontWeight: 700, color: v.color }}>Difference</span>
+                <span style={{ fontWeight: 800, color: v.color, fontFamily: "'DM Mono', monospace" }}>
+                  {compareDiffPct <= 0 ? "" : "+"}{fmt(compareDiffPct * 100, 2)}%
+                </span>
+              </div>
+              <div style={{ fontSize: 11, color: T.textSec, marginTop: 6 }}>
+                On a {home.symbol}5,000 change, that's about {home.symbol}{fmt(Math.abs(5000 * compareDiffPct))} {compareDiffPct <= 0 ? "saved" : "lost"} vs mid-market.
+              </div>
+            </div>
+          )}
+
+          <Btn onClick={addToCompare} disabled={shopHomePerTravel <= 0} variant="secondary">
+            + Add to comparison
+          </Btn>
+        </div>
+      </Card>
+
+      {/* Comparison list */}
+      {compareList.length > 0 && (
+        <Card title={`⚖️ Comparing ${compareList.length} Shop${compareList.length > 1 ? "s" : ""}`}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {[...compareList].sort((a, b) => a.homePerTravel - b.homePerTravel).map((c, i) => {
+              const isBest = c.id === bestId;
+              const cv = verdict(c.diff);
+              return (
+                <div key={c.id} style={{
+                  background: isBest ? T.goodBg : T.input,
+                  border: isBest ? `2px solid ${T.good}` : `1px solid ${T.divider}`,
+                  borderRadius: 10, padding: "10px 12px",
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                }}>
+                  <div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {isBest && <span style={{ fontSize: 10, fontWeight: 800, color: "#fff", background: T.good, padding: "1px 6px", borderRadius: 20 }}>BEST</span>}
+                      <span style={{ fontSize: 13, fontWeight: 700 }}>{c.name}</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: T.textTer, marginTop: 2 }}>
+                      Board: {c.format === "homePerTravel" ? home.symbol : travel.symbol}{fmt(c.raw, 4)} → {home.symbol}{fmt(c.homePerTravel, 4)}/{travel.code}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 13, fontWeight: 800, color: cv?.color, fontFamily: "'DM Mono', monospace" }}>
+                      {c.diff <= 0 ? "" : "+"}{fmt(c.diff * 100, 2)}%
+                    </span>
+                    <button onClick={() => removeFromCompare(c.id)} style={{ background: "none", border: "none", color: T.textTer, fontSize: 15, cursor: "pointer", padding: 2 }}>✕</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {/* Beginner guide */}
+      <Card>
+        <button onClick={() => setShowGuide(!showGuide)}
+          style={{ width: "100%", background: "none", border: "none", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", padding: 0, fontFamily: "inherit" }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: T.text }}>📖 First time? How to read exchange boards</span>
+          <span style={{ fontSize: 14, color: T.textTer }}>{showGuide ? "▲" : "▼"}</span>
+        </button>
+        {showGuide && (
+          <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10, fontSize: 13, color: T.textSec, lineHeight: 1.5 }}>
+            <div style={{ padding: "10px 12px", background: T.accentLight, borderRadius: 8 }}>
+              <strong style={{ color: T.accent }}>You are BUYING {travel.code} with your {home.code}.</strong> The shop is selling you foreign currency. Answers below match the format toggle you picked above (<strong>{rateFormat === "homePerTravel" ? `${home.symbol} per 1 ${travel.code}` : `${travel.code} per 1 ${home.code}`}</strong>).
+            </div>
+
+            {/* Q1: Buy vs Sell — does NOT depend on format */}
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                <strong style={{ color: T.text }}>Buy or Sell column?</strong>
+                <span style={{ fontSize: 12, fontWeight: 800, color: "#fff", background: T.accent, padding: "2px 10px", borderRadius: 20, whiteSpace: "nowrap" }}>SELL</span>
+              </div>
+              <p style={{ margin: "4px 0 0" }}>
+                Boards show two columns ("WE BUY" / "WE SELL") from the <em>shop's</em> point of view. The shop is <em>selling</em> you {travel.code}, so read the <strong>SELL</strong> column (sometimes "We Sell" or "Ask").
+              </p>
+            </div>
+
+            {/* Q2: Highest or lowest — FLIPS with format */}
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                <strong style={{ color: T.text }}>Highest or lowest number?</strong>
+                <span style={{ fontSize: 12, fontWeight: 800, color: "#fff", background: T.good, padding: "2px 10px", borderRadius: 20, whiteSpace: "nowrap" }}>
+                  {rateFormat === "homePerTravel" ? "LOWEST" : "HIGHEST"}
+                </span>
+              </div>
+              <p style={{ margin: "4px 0 0" }}>
+                {rateFormat === "homePerTravel" ? (
+                  <>With the <strong>{home.symbol} per 1 {travel.code}</strong> format (like {home.symbol}{midHomePerTravel > 0 ? fmt(midHomePerTravel, midHomePerTravel < 1 ? 4 : 2) : "0.05"}), you want the <strong>lowest</strong> number — you're paying fewer {home.code} for each {travel.code}.</>
+                ) : (
+                  <>With the <strong>{travel.code} per 1 {home.code}</strong> format (like {marketRate > 0 ? fmt(marketRate, marketRate < 1 ? 4 : 2) : "20.68"}), you want the <strong>highest</strong> number — you're getting more {travel.code} for each {home.code}.</>
+                )}
+              </p>
+            </div>
+
+            {/* Q3: tricks */}
+            <div>
+              <strong style={{ color: T.text }}>Watch for tricks</strong>
+              <p style={{ margin: "4px 0 0" }}>
+                "No commission" shops often bake a worse rate into the board. A big bright number on the street sign might be the <em>{rateFormat === "homePerTravel" ? "buy" : "buy"}</em> rate, not yours. Always confirm the SELL rate and ask exactly how much {travel.code} you'll receive before handing over cash.
+              </p>
+            </div>
+
+            {/* Q4: benchmarks */}
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                <strong style={{ color: T.text }}>What's a good rate?</strong>
+                <span style={{ fontSize: 12, fontWeight: 800, color: "#fff", background: T.good, padding: "2px 10px", borderRadius: 20, whiteSpace: "nowrap" }}>WITHIN 1%</span>
+              </div>
+              <p style={{ margin: "4px 0 0" }}>
+                Within ~1% of mid-market is great. 1–2.5% is normal. Over 5% away, walk to the next shop — on a busy exchange street there's always a better one nearby.
+              </p>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {/* Record exchange */}
+      <Card title={`✍️ Record an Exchange`}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <p style={{ margin: 0, fontSize: 12, color: T.textTer }}>
+            Already changed money? Log the actual amounts here to track your wallet.
+          </p>
           <input value={shop} onChange={(e) => setShop(e.target.value)} placeholder="Shop / location"
             style={{ width: "100%", boxSizing: "border-box", background: T.input, border: `1px solid ${T.inputBorder}`, borderRadius: 10, color: T.text, padding: "10px 14px", fontSize: 14, fontFamily: "inherit", outline: "none" }} />
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-            <NumInput value={homeAmt} onChange={setHomeAmt} placeholder="0" suffix={home.code} />
-            <NumInput value={travelAmt} onChange={setTravelAmt} placeholder="0" suffix={travel.code} />
+            <NumInput value={homeAmt} onChange={setHomeAmt} placeholder="You gave" suffix={home.code} />
+            <NumInput value={travelAmt} onChange={setTravelAmt} placeholder="You got" suffix={travel.code} />
           </div>
           {shopRate > 0 && (
             <div style={{ background: T.input, borderRadius: 10, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 5 }}>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ fontSize: 12, color: T.textSec }}>Shop rate</span>
-                <span style={{ fontSize: 14, fontWeight: 700, fontFamily: "'DM Mono', monospace" }}>1 = {fmt(shopRate, 4)}</span>
+                <span style={{ fontSize: 12, color: T.textSec }}>Effective rate</span>
+                <span style={{ fontSize: 14, fontWeight: 700, fontFamily: "'DM Mono', monospace" }}>1 {home.code} = {fmt(shopRate, 4)}</span>
               </div>
               {marketRate > 0 && (
                 <>
