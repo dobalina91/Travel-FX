@@ -70,12 +70,41 @@ function fmt(num, dec = 2) {
 }
 
 // ─── Storage ────────────────────────────────────────────────────────────────
+// Robust persistence: uses localStorage (works in real browsers / deployed PWA),
+// falls back to window.storage (Claude artifact preview only). One file, both work.
 
-// loadState handled async in useEffect
+async function loadState() {
+  // 1. Try localStorage (browsers, deployed PWA)
+  try {
+    if (typeof localStorage !== "undefined" && localStorage) {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) return JSON.parse(raw);
+    }
+  } catch (e) { /* localStorage unavailable, try fallback */ }
+  // 2. Fall back to window.storage (artifact sandbox)
+  try {
+    if (typeof window !== "undefined" && window.storage) {
+      const result = await window.storage.get(STORAGE_KEY);
+      if (result && result.value) return JSON.parse(result.value);
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
 
 function saveState(state) {
+  const json = JSON.stringify(state);
+  // 1. Try localStorage first
   try {
-    window.storage.set(STORAGE_KEY, JSON.stringify(state));
+    if (typeof localStorage !== "undefined" && localStorage) {
+      localStorage.setItem(STORAGE_KEY, json);
+      return;
+    }
+  } catch (e) { /* localStorage unavailable, try fallback */ }
+  // 2. Fall back to window.storage
+  try {
+    if (typeof window !== "undefined" && window.storage) {
+      window.storage.set(STORAGE_KEY, json);
+    }
   } catch (e) { /* ignore */ }
 }
 
@@ -346,11 +375,8 @@ export default function TravelFX() {
 
   useEffect(() => {
     (async () => {
-      try {
-        const result = await window.storage.get(STORAGE_KEY);
-        if (result && result.value) setState(JSON.parse(result.value));
-        else setState(defaultState());
-      } catch (e) { setState(defaultState()); }
+      const loaded = await loadState();
+      setState(loaded || defaultState());
       setLoading(false);
     })();
   }, []);
